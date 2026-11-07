@@ -120,14 +120,15 @@ Producer ──► Exchange ──(binding: routing key)──► Queue ──�
 
 ```mermaid
 flowchart LR
-    PUSH["git push main<br/>or pull request"] --> J1
-    subgraph J1 ["Job 1: Build & Test · ubuntu-latest"]
+    PUSH["git push main<br/>or pull request"]
+    subgraph J1 ["Job 1: Build & Test - ubuntu-latest"]
       A["checkout"] --> B["setup JDK 17<br/>Maven cache"] --> C["mvn clean test<br/>23 tests on H2"] --> D["mvn package<br/>build JAR"] --> E["upload surefire<br/>reports"]
     end
-    J1 -->|"needs: test<br/>only on push to main"| J2
-    subgraph J2 ["Job 2: Deploy · self-hosted runner on VPS"]
+    subgraph J2 ["Job 2: Deploy - self-hosted runner on VPS"]
       F["checkout"] --> G["bash deploy.sh<br/>blue-green"]
     end
+    PUSH --> A
+    E -->|"needs: test<br/>only on push to main"| F
 ```
 
 - **Pull requests** run Job 1 only, so a broken change is caught before merge.
