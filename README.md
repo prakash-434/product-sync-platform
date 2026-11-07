@@ -106,6 +106,148 @@ Producer ──► Exchange ──(binding: routing key)──► Queue ──�
 
 ---
 
+## Fixing the two gaps, step by step (DLQ + transaction per chunk)
+
+### Problem 1: a poison message loops forever
+Today, if the listener throws (bad data, DB down), Spring's default is **reject + requeue**. RabbitMQ puts the message back at the head of the queue and redelivers it immediately: the same failure, thousands of times a minute, a CPU spike, and nothing else in the queue gets processed.
+
+**Fix: bounded retries, then park the message in a dead-letter queue.**
+
+```
+products.exchange ──► products.bulk.queue ──(3 failed attempts → rejected, no requeue)──► products.dlx ──► products.bulk.dlq
+```
+
+**Step 1: declare the DLX and DLQ** (`RabbitMQConfig`):
+```java
+public static final String DLX = "products.dlx";
+public static final String DLQ = "products.bulk.dlq";
+
+@Bean
+public Queue productsBulkQueue() {
+    return QueueBuilder.durable(queueName)
+            .withArgument("x-dead-letter-exchange", DLX)       // where rejected messages go
+            .withArgument("x-dead-letter-routing-key", DLQ)
+            .build();
+}
+@Bean public DirectExchange deadLetterExchange() { return new DirectExchange(DLX); }
+@Bean public Queue deadLetterQueue() { return QueueBuilder.durable(DLQ).build(); }
+@Bean public Binding dlqBinding() {
+    return BindingBuilder.bind(deadLetterQueue()).to(deadLetterExchange()).with(DLQ);
+}
+```
+
+**Step 2: retry a few times, then reject without requeue** (`application.properties`):
+```properties
+spring.rabbitmq.listener.simple.retry.enabled=true
+spring.rabbitmq.listener.simple.retry.max-attempts=3
+spring.rabbitmq.listener.simple.retry.initial-interval=2s
+spring.rabbitmq.listener.simple.retry.multiplier=2
+spring.rabbitmq.listener.simple.default-requeue-rejected=false
+spring.rabbitmq.listener.simple.prefetch=1
+```
+After the 3rd failure, Spring's default recoverer (`RejectAndDontRequeueRecoverer`) **rejects** the message; because the queue has a DLX, RabbitMQ moves it to `products.bulk.dlq`, together with an `x-death` header (reason, original queue, count). A message that can't even be converted from JSON is treated as **fatal** (never requeued), so it also ends up in the DLQ instead of looping.
+
+**Gotcha you'll hit (great interview story):** the queue already exists *without* those arguments, so redeclaring it fails on startup with `PRECONDITION_FAILED - inequivalent arg 'x-dead-letter-exchange'`. A queue's arguments can't change after it's created. Options: delete the empty queue and let the app recreate it, use a new queue name, or (RabbitMQ's recommended way) set the DLX through a **policy**, which can be changed at any time without redeclaring:
+```bash
+rabbitmqctl set_policy bulk-dlx "^products\.bulk\.queue$" \
+  '{"dead-letter-exchange":"products.dlx","dead-letter-routing-key":"products.bulk.dlq"}' --apply-to queues
+```
+
+**Operating the DLQ:** look at parked messages in the management UI (`:15672` → Queues → `products.bulk.dlq` → Get messages). After fixing the cause, **shovel** them back to `products.bulk.queue` to replay them. That's safe because the consumer is idempotent (below). Alert when DLQ depth > 0.
+
+### Problem 2: one bad record rolls back the whole upload
+Today the whole listener is one `@Transactional`. If record 90,001 of 100,000 breaks a constraint, **all 90,000 good rows roll back**, and the retry does the same work again.
+
+**Fix: one transaction per 1,000-record chunk**, plus a set-based duplicate check.
+
+```java
+@Service
+@RequiredArgsConstructor
+public class BulkProductConsumer {
+    private static final int BATCH_SIZE = 1000;
+    private final ChemProductRepository repo;
+    private final BulkJobRepository jobs;
+    private final TransactionTemplate tx;        // built on testDensityTransactionManager (below)
+
+    @RabbitListener(queues = "${products.rabbitmq.queue}")
+    @CacheEvict(value = "products", allEntries = true)
+    public void processBulkProducts(BulkProductMessage msg) {
+        List<ChemProductRequest> all = dedupeByKey(msg.getProducts());   // same key twice in one upload
+        int saved = 0, skipped = 0, failed = 0;
+        for (int i = 0; i < all.size(); i += BATCH_SIZE) {
+            List<ChemProductRequest> chunk = all.subList(i, Math.min(i + BATCH_SIZE, all.size()));
+            try {
+                ChunkResult r = tx.execute(status -> saveChunk(chunk));     // commits or rolls back THIS chunk
+                saved += r.saved();
+                skipped += r.skipped();
+            } catch (DataAccessException e) {
+                failed += chunk.size();
+                log.warn("bulk {} chunk {} failed: {}", msg.getRequestId(), i / BATCH_SIZE + 1, e.getMessage());
+            }
+        }
+        jobs.finish(msg.getRequestId(), saved, skipped, failed);
+        if (failed > 0) {
+            throw new BulkChunkFailedException(msg.getRequestId(), failed);  // → retry → DLQ after 3 attempts
+        }
+    }
+
+    private ChunkResult saveChunk(List<ChemProductRequest> chunk) {
+        Set<String> keys = chunk.stream().map(ChemProductRequest::getCatSizeMain).collect(Collectors.toSet());
+        Set<String> existing = repo.findExistingKeys(keys);              // 1 query instead of 1,000
+        List<ChemProduct> fresh = chunk.stream()
+                .filter(r -> !existing.contains(r.getCatSizeMain()))
+                .map(this::mapToEntity)
+                .toList();
+        repo.saveAll(fresh);
+        return new ChunkResult(fresh.size(), chunk.size() - fresh.size());
+    }
+
+    private static List<ChemProductRequest> dedupeByKey(List<ChemProductRequest> in) {
+        Map<String, ChemProductRequest> byKey = new LinkedHashMap<>();
+        in.forEach(r -> byKey.putIfAbsent(r.getCatSizeMain(), r));       // keep the first, keep the order
+        return new ArrayList<>(byKey.values());
+    }
+}
+```
+
+```java
+// Repository: one IN query per chunk. SQL Server allows at most 2,100 parameters, and 1,000 keys fits.
+@Query("select p.catSizeMain from ChemProduct p where p.catSizeMain in :keys")
+Set<String> findExistingKeys(@Param("keys") Collection<String> keys);
+
+// Config: a TransactionTemplate on the right transaction manager
+@Bean
+TransactionTemplate bulkTx(@Qualifier("testDensityTransactionManager") PlatformTransactionManager tm) {
+    return new TransactionTemplate(tm);
+}
+```
+
+**Why it fits together:**
+- **Chunk isolation:** a failing chunk rolls back only its 1,000 rows; the others stay committed.
+- **Retry is safe:** the retried message re-runs every chunk, but committed rows are found by `findExistingKeys` and **skipped**, so only the failed chunk is attempted again. That's **idempotency** doing its job.
+- **Still failing after 3 attempts** → the message lands in the **DLQ** with the job marked `PARTIAL`.
+- **Why `TransactionTemplate` and not `@Transactional` on `saveChunk`?** Calling a `@Transactional` method **from the same class** skips the Spring proxy (**self-invocation**), so no transaction would start. `TransactionTemplate` makes the boundary explicit. The alternative is moving `saveChunk` into a separate bean.
+- **1,000 `exists` calls → 1 `IN` query:** the biggest speed-up for imports.
+- **Note:** with `IDENTITY` ids, Hibernate can't batch inserts (it needs each generated id), so `saveAll` still inserts row by row. For more speed, use `JdbcTemplate.batchUpdate` or SQL Server bulk copy.
+
+### Problem 3 (bonus): the partner can't see the result
+Add a `bulk_jobs` table (`request_id, status, saved, skipped, failed, created_at, finished_at`):
+- **Producer:** insert `QUEUED`, then publish, then return `202 + requestId`.
+- **Consumer:** mark `RUNNING`, then `DONE` / `PARTIAL` / `FAILED` with the counts.
+- **New endpoint:** `GET /api/3a/products/bulk/{requestId}` returns the status, so the partner can poll it (or you POST to a webhook when it's done).
+
+### Tests to add
+| Test | Checks |
+|---|---|
+| Consumer unit test (Mockito) | A chunk that throws doesn't stop the other chunks; counts are correct; the exception is rethrown when `failed > 0` |
+| Duplicate test | The same key twice in one upload is saved once; keys already in the DB are skipped |
+| Integration (**Testcontainers RabbitMQ**) | A message that always fails ends up in `products.bulk.dlq` after 3 attempts, with an `x-death` header |
+| Idempotency | Processing the same message twice leaves the same row count |
+
+**How to tell it in an interview:** *"I noticed the bulk consumer had two weaknesses: a poison message would be requeued forever, and one bad row rolled back the whole upload. I added bounded retries with a dead-letter queue, changed it to one transaction per 1,000-record chunk with a set-based duplicate check, and made the retry idempotent, so only failed chunks are re-attempted. I also hit RabbitMQ's `PRECONDITION_FAILED` on the existing queue and solved it with a policy."*
+
+---
+
 ## Swagger UI: how it's hosted for the partner
 
 - **springdoc-openapi** generates the OpenAPI spec from the controllers and `@Valid` DTOs, so the docs can't drift from the code.
