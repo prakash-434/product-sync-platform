@@ -20,18 +20,18 @@
 
 ```mermaid
 flowchart LR
-    C[China partner<br/>API client] -->|HTTPS| CF[Cloudflare<br/>CDN, DDoS]
-    CF --> NG[Nginx<br/>TLS Let's Encrypt]
-    NG -->|/api, /swagger-ui, /api-docs,<br/>/actuator → live colour| RL[RateLimitFilter<br/>Bucket4j → 429]
-    RL --> JW[ProductJwtFilter → 401] --> CT[Controllers<br/>@Valid DTOs] --> SV[Services<br/>@Transactional, @Cacheable]
-    SV <--> R[(Redis<br/>list 5 min, item 10 min)]
-    SV -->|bulk-async| EX{{products.exchange<br/>direct}}
-    EX -->|routing key products.bulk| Q[(products.bulk.queue<br/>durable)]
-    Q --> CON[BulkProductConsumer<br/>@RabbitListener]
-    CON --> DB[(SQL Server<br/>partner catalogue)]
+    C["China partner<br/>API client"] -->|"HTTPS"| CF["Cloudflare<br/>CDN, DDoS"]
+    CF --> NG["Nginx<br/>TLS Let's Encrypt"]
+    NG -->|"/api, /swagger-ui, /api-docs,<br/>/actuator → live colour"| RL["RateLimitFilter<br/>Bucket4j → 429"]
+    RL --> JW["ProductJwtFilter → 401"] --> CT["Controllers<br/>@Valid DTOs"] --> SV["Services<br/>@Transactional, @Cacheable"]
+    SV <--> R[("Redis<br/>list 5 min, item 10 min")]
+    SV -->|"bulk-async"| EX{{"products.exchange<br/>direct"}}
+    EX -->|"routing key products.bulk"| Q[("products.bulk.queue<br/>durable")]
+    Q --> CON["BulkProductConsumer<br/>@RabbitListener"]
+    CON --> DB[("SQL Server<br/>partner catalogue")]
     SV --> DB
-    SV -->|JdbcTemplate, read-only| SAP[(SAP DB)]
-    DB --> REP[SAP stock<br/>reconciliation reports]
+    SV -->|"JdbcTemplate, read-only"| SAP[("SAP DB")]
+    DB --> REP["SAP stock<br/>reconciliation reports"]
 ```
 
 ### Request flow: `GET /api/3a/products?keyword=acid&page=0&size=20`
@@ -120,13 +120,13 @@ Producer ──► Exchange ──(binding: routing key)──► Queue ──�
 
 ```mermaid
 flowchart LR
-    PUSH[git push main<br/>or pull request] --> J1
-    subgraph J1 [Job 1: Build & Test · ubuntu-latest]
-      A[checkout] --> B[setup JDK 17<br/>Maven cache] --> C[mvn clean test<br/>23 tests on H2] --> D[mvn package<br/>build JAR] --> E[upload surefire<br/>reports]
+    PUSH["git push main<br/>or pull request"] --> J1
+    subgraph J1 ["Job 1: Build & Test · ubuntu-latest"]
+      A["checkout"] --> B["setup JDK 17<br/>Maven cache"] --> C["mvn clean test<br/>23 tests on H2"] --> D["mvn package<br/>build JAR"] --> E["upload surefire<br/>reports"]
     end
-    J1 -->|needs: test<br/>only on push to main| J2
-    subgraph J2 [Job 2: Deploy · self-hosted runner on VPS]
-      F[checkout] --> G[bash deploy.sh<br/>blue-green]
+    J1 -->|"needs: test<br/>only on push to main"| J2
+    subgraph J2 ["Job 2: Deploy · self-hosted runner on VPS"]
+      F["checkout"] --> G["bash deploy.sh<br/>blue-green"]
     end
 ```
 
